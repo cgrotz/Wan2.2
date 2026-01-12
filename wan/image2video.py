@@ -118,7 +118,6 @@ class WanI2V:
                 use_sp=use_sp,
                 dit_fsdp=dit_fsdp,
                 shard_fn=shard_fn,
-                shard_fn=shard_fn,
                 convert_model_dtype=convert_model_dtype,
                 lora_path=lora_path)
         else:
@@ -132,8 +131,6 @@ class WanI2V:
                 use_sp=use_sp,
                 dit_fsdp=dit_fsdp,
                 shard_fn=shard_fn,
-                shard_fn=shard_fn,
-                convert_model_dtype=convert_model_dtype,
                 convert_model_dtype=convert_model_dtype,
                 lora_path=lora_path_high)
         else:
