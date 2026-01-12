@@ -682,4 +682,3 @@ class WanModel(ModelMixin, ConfigMixin):
         # 4. Load state dict
         model.load_state_dict(state_dict, strict=False)
         return model.to(device).eval()
-```
