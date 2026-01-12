@@ -28,6 +28,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.lora_utils import apply_lora
 from .utils.utils import best_output_size, masks_like
 
 
@@ -45,6 +46,7 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        lora_path=None,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -106,7 +108,8 @@ class WanTI2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            lora_path=lora_path)
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -116,7 +119,7 @@ class WanTI2V:
         self.sample_neg_prompt = config.sample_neg_prompt
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, lora_path=None):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -148,6 +151,9 @@ class WanTI2V:
 
         if dist.is_initialized():
             dist.barrier()
+        
+        if lora_path is not None:
+             model = apply_lora(model, lora_path)
 
         if dit_fsdp:
             model = shard_fn(model)

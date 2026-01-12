@@ -585,9 +585,10 @@ class WanModel(ModelMixin, ConfigMixin):
             name = tensor.name
             # Use data.shape to ensure we get the actual array dimensions
             # tensor.shape provided by gguf might differ or be reversed differently
-            
+            shape = tensor.data.shape 
+            # print(f"SCAN: {name} {shape}")
+
             if name.endswith("patch_embedding.weight"):
-                shape = tensor.data.shape
                 if len(shape) >= 2:
                     current_in = 16
                     current_dim = 0
@@ -601,14 +602,12 @@ class WanModel(ModelMixin, ConfigMixin):
                     print(f"  Patch Detect: in={current_in}, dim={current_dim}")
 
             elif "self_attn.q.weight" in name:
-                shape = tensor.data.shape
                 if len(shape) >= 2:
                     d_max = max(shape)
                     detected_dims['dim'] = max(detected_dims['dim'], d_max)
                     # print(f"  Attn Detect: dim={d_max} from {shape}")
 
             elif "ffn.0.weight" in name or "ffn.2.weight" in name:
-                shape = tensor.data.shape
                 if len(shape) >= 2:
                     s1, s2 = shape[0], shape[1]
                     local_dim = min(s1, s2)
@@ -655,54 +654,55 @@ class WanModel(ModelMixin, ConfigMixin):
         # This prevents 56GB allocations for FP32 models
         model.to(dtype=dtype)
         
-        # 3. Load weights directly into model parameters to minimize memory usage
-        # This avoids building a 30GB+ state_dict in RAM
-        name_to_param = dict(model.named_parameters())
-        model_keys = set(name_to_param.keys())
+        # 3. Load weights
+        state_dict = {}
+        model_keys = set(model.state_dict().keys())
         
-        with torch.no_grad():
-            for tensor in reader.tensors:
-                name = tensor.name
+        for tensor in reader.tensors:
+            name = tensor.name
+            
+            # Key mapping logic
+            mapped_name = name
+            for prefix in ["model.diffusion_model.", "diffusion_model.", "model."]:
+                if name.startswith(prefix):
+                    mapped_name = name[len(prefix):]
+                    break
+            
+            if mapped_name in model_keys:
+                # Load as float32 first to avoid precision issues during permute/pad? 
+                # Or load directly? 
+                # tensor.data is numpy. 
+                data = torch.from_numpy(tensor.data.copy())
                 
-                # Key mapping logic
-                mapped_name = name
-                for prefix in ["model.diffusion_model.", "diffusion_model.", "model."]:
-                    if name.startswith(prefix):
-                        mapped_name = name[len(prefix):]
-                        break
+                # Permute Patch Embed
+                if mapped_name == "patch_embedding.weight":
+                     data = data.permute(4, 3, 2, 1, 0) # [out_c, in_c, d, h, w]
                 
-                if mapped_name in model_keys:
-                    # Use from_numpy on memmap directly (copy=False usually implied or managed by torch)
-                    # We cast to target dtype immediately to save memory
-                    data = torch.from_numpy(tensor.data)
-                    
-                    # Permute Patch Embed
-                    if mapped_name == "patch_embedding.weight":
-                         data = data.permute(4, 3, 2, 1, 0) # [out_c, in_c, d, h, w]
-                    
-                    param = name_to_param[mapped_name]
-                    target_shape = param.shape
-                    
-                    if data.shape != target_shape:
-                         if data.ndim == len(target_shape):
-                             # Create padded tensor in target dtype to save memory
-                             new_data = torch.zeros(target_shape, dtype=dtype, device=data.device)
-                             
-                             # Convert source data to dtype
-                             data_casted = data.to(dtype=dtype)
-                             
-                             slices = tuple(slice(0, min(ds, ts)) for ds, ts in zip(data.shape, target_shape))
-                             new_data[slices] = data_casted[slices]
-                             
-                             print(f"GGUF: Padded {mapped_name} from {data.shape} to {target_shape}")
-                             data = new_data
-                         else:
-                             print(f"GGUF: Warning - Rank mismatch for {mapped_name}. {data.shape} vs {target_shape}")
-                    
-                    # Copy directly into model parameter (handles device/dtype transfer implicitly if param is on gpu)
-                    # We ensure data is effectively cast to param's dtype
-                    param.copy_(data)
-                    
-                    model_keys.remove(mapped_name)
-                    
-        return model.eval()
+                target_shape = model.state_dict()[mapped_name].shape
+                
+                if data.shape != target_shape:
+                     if data.ndim == len(target_shape):
+                         # Create padded tensor in target dtype to save memory
+                         new_data = torch.zeros(target_shape, dtype=dtype, device=data.device)
+                         
+                         # Convert source data to dtype
+                         data_casted = data.to(dtype=dtype)
+                         
+                         slices = tuple(slice(0, min(ds, ts)) for ds, ts in zip(data.shape, target_shape))
+                         new_data[slices] = data_casted[slices]
+                         
+                         print(f"GGUF: Padded {mapped_name} from {data.shape} to {target_shape}")
+                         data = new_data
+                     else:
+                         print(f"GGUF: Warning - Rank mismatch for {mapped_name}. {data.shape} vs {target_shape}")
+                
+                # Ensure data is correct dtype if not padded
+                if data.dtype != dtype:
+                    data = data.to(dtype=dtype)
+
+                state_dict[mapped_name] = data
+                model_keys.remove(mapped_name)
+        
+        # 4. Load state dict
+        model.load_state_dict(state_dict, strict=False)
+        return model.to(device).eval()

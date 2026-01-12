@@ -28,6 +28,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.lora_utils import apply_lora
 
 
 class WanI2V:
@@ -46,6 +47,7 @@ class WanI2V:
         convert_model_dtype=False,
         low_noise_model=None,
         high_noise_model=None,
+        lora_path=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -115,7 +117,9 @@ class WanI2V:
                 use_sp=use_sp,
                 dit_fsdp=dit_fsdp,
                 shard_fn=shard_fn,
-                convert_model_dtype=convert_model_dtype)
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype,
+                lora_path=lora_path)
         else:
             self.low_noise_model = low_noise_model
 
@@ -127,7 +131,9 @@ class WanI2V:
                 use_sp=use_sp,
                 dit_fsdp=dit_fsdp,
                 shard_fn=shard_fn,
-                convert_model_dtype=convert_model_dtype)
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype,
+                lora_path=lora_path)
         else:
             self.high_noise_model = high_noise_model
 
@@ -139,7 +145,7 @@ class WanI2V:
         self.sample_neg_prompt = config.sample_neg_prompt
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, lora_path=None):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -171,6 +177,9 @@ class WanI2V:
 
         if dist.is_initialized():
             dist.barrier()
+        
+        if lora_path is not None:
+             model = apply_lora(model, lora_path)
 
         if dit_fsdp:
             model = shard_fn(model)

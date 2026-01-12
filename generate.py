@@ -221,6 +221,12 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
+    parser.add_argument(
+        "--lora_path",
+        type=str,
+        default=None,
+        help="Path to the LoRA checkpoint to load."
+    )
 
     # animate
     parser.add_argument(
@@ -412,6 +418,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            lora_path=args.lora_path,
         )
 
         logging.info(f"Generating video ...")
@@ -437,6 +444,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            lora_path=args.lora_path,
         )
 
         logging.info(f"Generating video ...")
@@ -491,6 +499,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            lora_path=args.lora_path,
         )
         logging.info(f"Generating video ...")
         video = wan_s2v.generate(
@@ -525,6 +534,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            lora_path=args.lora_path,
         )
         logging.info("Generating video ...")
         video = wan_i2v.generate(

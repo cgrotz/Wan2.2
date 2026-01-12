@@ -26,6 +26,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.lora_utils import apply_lora
 
 
 class WanT2V:
@@ -42,6 +43,7 @@ class WanT2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        lora_path=None,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -105,7 +107,9 @@ class WanT2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            shard_fn=shard_fn,
+            convert_model_dtype=convert_model_dtype,
+            lora_path=lora_path)
 
         self.high_noise_model = WanModel.from_pretrained(
             checkpoint_dir, subfolder=config.high_noise_checkpoint)
@@ -114,7 +118,9 @@ class WanT2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            shard_fn=shard_fn,
+            convert_model_dtype=convert_model_dtype,
+            lora_path=lora_path)
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -123,7 +129,7 @@ class WanT2V:
         self.sample_neg_prompt = config.sample_neg_prompt
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, lora_path=None):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -155,6 +161,9 @@ class WanT2V:
 
         if dist.is_initialized():
             dist.barrier()
+        
+        if lora_path is not None:
+            model = apply_lora(model, lora_path)
 
         if dit_fsdp:
             model = shard_fn(model)

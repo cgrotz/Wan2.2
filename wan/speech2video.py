@@ -34,6 +34,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.lora_utils import apply_lora
 
 
 def load_safetensors(path):
@@ -58,6 +59,7 @@ class WanS2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        lora_path=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -126,7 +128,8 @@ class WanS2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            lora_path=lora_path)
 
         self.audio_encoder = AudioEncoder(
             model_id=os.path.join(checkpoint_dir,
@@ -144,7 +147,7 @@ class WanS2V:
         self.audio_sample_m = 0
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, lora_path=None):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -175,6 +178,9 @@ class WanS2V:
 
         if dist.is_initialized():
             dist.barrier()
+
+        if lora_path is not None:
+             model = apply_lora(model, lora_path)
 
         if dit_fsdp:
             model = shard_fn(model)
