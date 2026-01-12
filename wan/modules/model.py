@@ -571,60 +571,63 @@ class WanModel(ModelMixin, ConfigMixin):
         
         cfg = WAN_CONFIGS[config_name]
 
-        # 1. Scan GGUF for architectural parameters
         reader = gguf.GGUFReader(gguf_path)
         
-        # Default overrides
-        overrides = {}
+        # 1. Scan for Max Dimensions
+        # We need to determine the structural requirements of the model.
+        # If the checkpoint has mixed dimensions (e.g. 5120 and 5440), we must instantiate the larger one
+        # and pad the smaller weights.
         
-        # Sniff dimensions from known tensors
+        detected_dims = {
+            'in_dim': 16, # Default
+            'dim': 5120,   # Default 14B
+            'ffn_dim': 13824 # Default
+        }
+        
         for tensor in reader.tensors:
             name = tensor.name
-            # Handle potential prefixes
+            shape = tensor.shape # GGUF shape
+            
             if name.endswith("patch_embedding.weight"):
-                # shape: [dim, in_dim, k, k, k]
-                # tensor.data is numpy array, shape is available via tensor.shape
-                # GGUF shape order might be reversed compared to PyTorch? 
-                # gguf-py tensor.shape returns [n, c, h, w] convention usually? 
-                # No, gguf-py tensor.shape is typically [dim0, dim1, ...] in numpy order (C-contiguous)
-                # But PyTorch Conv3d weight is [out_channels, in_channels, d, h, w]
-                # Let's check GGUF spec/gguf-py. 
-                # Usually GGUF stores weights as [out, in] for Linear.
-                # For Conv3d, it might be [out, in, d, h, w].
-                # If mismatch was: [5120, 36, 1, 2, 2] vs [5120, 16, 1, 2, 2]
-                # creating a param with [5120, 36, ...] means the file has 36 at index 1.
-                # So we trust index 1 for in_dim if rank is 5.
-                if len(tensor.shape) == 5:
-                    overrides['in_dim'] = int(tensor.shape[1])
-                    overrides['dim'] = int(tensor.shape[0])
+                # GGUF [5120, 36, 1, 2, 5120] -> [out, in, d, h, w] ??
+                # Based on previous error: [5120, 2, 1, 36, 5120] after permute(4,3,2,1,0)
+                # So original was [5120, 36, 1, 2, 5120].
+                # Index 1 is 36 (in_dim).
+                # Index 0 is 5120 (dim/out).
+                if len(shape) >= 2:
+                    detected_dims['in_dim'] = max(detected_dims.get('in_dim', 0), int(shape[1]))
+                    # detected_dims['dim'] = max(detected_dims.get('dim', 0), int(shape[0])) # Usually match
             
-            elif name.endswith("blocks.0.self_attn.q.weight"):
-                # Linear weight: [out_features, in_features]
-                # Mismatch was: copying [5120, 5440]
-                # This implies out=5120, in=5440.
-                # So dim (input) is index 1.
-                if len(tensor.shape) >= 2:
-                     overrides['dim'] = int(tensor.shape[1])
+            elif name.endswith("self_attn.q.weight"):
+                # GGUF [out, in] or [in, out]?
+                # Error: [5120, 5440] (PyTorch [out, in]).
+                # So GGUF is [5120, 5440].
+                # dim (input) is 5440. internal is 5120.
+                if len(shape) >= 2:
+                     detected_dims['dim'] = max(detected_dims.get('dim', 0), int(shape[1]))
             
-            elif name.endswith("blocks.0.ffn.0.weight"):
-                # Linear weight: [out, in] -> [ffn_dim, dim]
-                # Mismatch: [13824, 5440]
-                # So ffn_dim is index 0.
-                if len(tensor.shape) >= 2:
-                    overrides['ffn_dim'] = int(tensor.shape[0])
+            elif name.endswith("ffn.0.weight"):
+                 # Error [13824, 5440] (PyTorch [out, in]).
+                 # ffn_dim = 13824. dim = 5440.
+                 if len(shape) >= 2:
+                     detected_dims['ffn_dim'] = max(detected_dims.get('ffn_dim', 0), int(shape[0]))
+            
+            elif name.endswith("ffn.2.weight"):
+                 # Error [5120, 14688] (PyTorch [out, in]).
+                 # input to ffn.2 is 14688. This should be ffn_dim.
+                 if len(shape) >= 2:
+                     detected_dims['ffn_dim'] = max(detected_dims.get('ffn_dim', 0), int(shape[1]))
 
-        if overrides:
-            print(f"GGUF: Detected overrides from weights: {overrides}")
+        print(f"GGUF: Detected Max Dimensions: {detected_dims}")
 
         def safe_get(key, default):
-            # Prioritize overrides, then config
-            if key in overrides:
-                return overrides[key]
+            if key in detected_dims:
+                return detected_dims[key]
             if key in cfg:
                 return cfg[key]
             return default
 
-        # 2. Initialize model structure
+        # 2. Initialize model structure with MAX dimensions
         model = cls(
             model_type=safe_get('model_type', config_name.split('-')[0]),
             patch_size=safe_get('patch_size', (1, 2, 2)),
@@ -643,14 +646,13 @@ class WanModel(ModelMixin, ConfigMixin):
             eps=safe_get('eps', 1e-6)
         )
         
-        # 3. Load weights
+        # 3. Load weights with Padding
         state_dict = {}
         model_keys = set(model.state_dict().keys())
         
         for tensor in reader.tensors:
             name = tensor.name
             
-            # Key mapping logic
             mapped_name = name
             for prefix in ["model.diffusion_model.", "diffusion_model.", "model."]:
                 if name.startswith(prefix):
@@ -660,21 +662,30 @@ class WanModel(ModelMixin, ConfigMixin):
             if mapped_name in model_keys:
                 data = torch.from_numpy(tensor.data.copy())
                 
-                # Manual Padding for patch_embedding if dim mismatch
+                # Special Permutation for Patch Embed
                 if mapped_name == "patch_embedding.weight":
-                     # PyTorch expects [out_c, in_c, d, h, w]
-                     # GGUF stores [w, h, d, in_c, out_c] (reversed shape)
-                     # So, permute from [w, h, d, in_c, out_c] to [out_c, in_c, d, h, w]
-                     # Indices: 4, 3, 2, 1, 0
-                     data = data.permute(4, 3, 2, 1, 0) # [out_c, in_c, d, h, w]
-                     
-                     if data.shape[0] != model.patch_embedding.weight.shape[0]:
-                         diff = model.patch_embedding.weight.shape[0] - data.shape[0]
-                         if diff > 0:
-                             print(f"GGUF: Padding patch_embedding {data.shape} to match model {model.patch_embedding.weight.shape}")
-                             # Pad dim 0 with zeros
-                             padding = torch.zeros(diff, *data.shape[1:], dtype=data.dtype, device=data.device)
-                             data = torch.cat([data, padding], dim=0)
+                     # Permute [w, h, d, in, out] -> [out, in, d, h, w]
+                     data = data.permute(4, 3, 2, 1, 0)
+
+                target_shape = model.state_dict()[mapped_name].shape
+                
+                # Check for mismatch and Pad
+                if data.shape != target_shape:
+                    # Creating a new tensor of target shape (zeros)
+                    # and copying data into it is safer/generic
+                    if data.ndim != len(target_shape):
+                         # If ranks don't match, we can't simple pad.
+                         # But for Linear/Conv they should match.
+                         print(f"Warning: Rank mismatch for {mapped_name}. {data.shape} vs {target_shape}")
+                    else:
+                         new_data = torch.zeros(target_shape, dtype=data.dtype, device=data.device)
+                         
+                         # Determine slice for copy
+                         slices = tuple(slice(0, min(ds, ts)) for ds, ts in zip(data.shape, target_shape))
+                         new_data[slices] = data[slices]
+                         
+                         print(f"GGUF: Padded {mapped_name} from {data.shape} to {target_shape}")
+                         data = new_data
 
                 state_dict[mapped_name] = data.to(dtype=dtype)
                 model_keys.remove(mapped_name)
