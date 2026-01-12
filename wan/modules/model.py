@@ -658,20 +658,28 @@ class WanModel(ModelMixin, ConfigMixin):
                     break
             
             if mapped_name in model_keys:
-                # Conversion to torch tensor
                 data = torch.from_numpy(tensor.data.copy())
-                # Squeeze/Reshape check? 
-                # Typically data is loaded as is. If there was a transpose needed (e.g. for Linear), 
-                # GGUF usually stores it 'transposed' relative to Torch or vice-versa?
-                # PyTorch Linear weight is [out, in].
-                # GGUF usually stores [in, out] if it's from llama.cpp context? 
-                # Wait, the error message said "copying param with shape [5120, 5440]".
-                # This matches PyTorch expectation for Linear(in=5440, out=5120).
-                # So we probably don't need to transpose.
                 
+                # Manual Padding for patch_embedding if dim mismatch
+                if mapped_name == "patch_embedding.weight":
+                     # PyTorch expects [out_c, in_c, d, h, w]
+                     # GGUF stores [w, h, d, in_c, out_c] (reversed shape)
+                     # So, permute from [w, h, d, in_c, out_c] to [out_c, in_c, d, h, w]
+                     # Indices: 4, 3, 2, 1, 0
+                     data = data.permute(4, 3, 2, 1, 0) # [out_c, in_c, d, h, w]
+                     
+                     if data.shape[0] != model.patch_embedding.weight.shape[0]:
+                         diff = model.patch_embedding.weight.shape[0] - data.shape[0]
+                         if diff > 0:
+                             print(f"GGUF: Padding patch_embedding {data.shape} to match model {model.patch_embedding.weight.shape}")
+                             # Pad dim 0 with zeros
+                             padding = torch.zeros(diff, *data.shape[1:], dtype=data.dtype, device=data.device)
+                             data = torch.cat([data, padding], dim=0)
+
                 state_dict[mapped_name] = data.to(dtype=dtype)
                 model_keys.remove(mapped_name)
         
         # 4. Load state dict
         model.load_state_dict(state_dict, strict=False)
         return model.to(device).eval()
+```
