@@ -574,49 +574,40 @@ class WanModel(ModelMixin, ConfigMixin):
         # 1. Scan GGUF for architectural parameters
         reader = gguf.GGUFReader(gguf_path)
         
-        cfg = WAN_CONFIGS[config_name]
-
-        # 1. Scan GGUF for architectural parameters
-        reader = gguf.GGUFReader(gguf_path)
-        
         detected_dims = {
-            'in_dim': 16,     # Default
-            'dim': 5120,      # Default
-            'ffn_dim': 13824  # Default
+            'in_dim': 0,
+            'dim': 0,
+            'ffn_dim': 0
         }
         
         print("GGUF: Scanning all tensor shapes for Max Dimensions...")
         for tensor in reader.tensors:
             name = tensor.name
-            shape = tensor.shape
-            
+            # Use data.shape to ensure we get the actual array dimensions
+            # tensor.shape provided by gguf might differ or be reversed differently
+            shape = tensor.data.shape 
+            # print(f"SCAN: {name} {shape}")
+
             if name.endswith("patch_embedding.weight"):
-                # Usually [out, in, d, h, w] or similar.
-                # Among dimensions, 'in_dim' is likely 16 or 36.
-                # 'dim' is likely 5120+.
                 if len(shape) >= 2:
                     current_in = 16
-                    current_dim = 5120
-                    # Heuristic: find dim=16 or 36.
+                    current_dim = 0
                     for s in shape:
                         if s in [16, 36]: 
                             current_in = s
                         elif s > 1000:
-                            current_dim = s
+                            current_dim = max(current_dim, s)
                     detected_dims['in_dim'] = max(detected_dims['in_dim'], current_in)
                     detected_dims['dim'] = max(detected_dims['dim'], current_dim)
-            
+                    print(f"  Patch Detect: in={current_in}, dim={current_dim}")
+
             elif "self_attn.q.weight" in name:
-                # Shape [out, in]. 
-                # Both dimensions should be related to 'dim' (or dim and predicted_dim).
-                # We want the max capacity.
                 if len(shape) >= 2:
                     d_max = max(shape)
                     detected_dims['dim'] = max(detected_dims['dim'], d_max)
+                    # print(f"  Attn Detect: dim={d_max} from {shape}")
 
             elif "ffn.0.weight" in name or "ffn.2.weight" in name:
-                # Shape [d1, d2]. One is dim, one is ffn_dim.
-                # dim < ffn_dim usually.
                 if len(shape) >= 2:
                     s1, s2 = shape[0], shape[1]
                     local_dim = min(s1, s2)
@@ -624,9 +615,13 @@ class WanModel(ModelMixin, ConfigMixin):
                     
                     detected_dims['dim'] = max(detected_dims['dim'], local_dim)
                     detected_dims['ffn_dim'] = max(detected_dims['ffn_dim'], local_ffn)
+                    # print(f"  FFN Detect: dim={local_dim}, ffn={local_ffn} from {shape}")
+            
+        # Fallbacks
+        if detected_dims['in_dim'] == 0: detected_dims['in_dim'] = 16
+        if detected_dims['dim'] == 0: detected_dims['dim'] = 5120
+        if detected_dims['ffn_dim'] == 0: detected_dims['ffn_dim'] = 13824
         
-        print(f"GGUF: Detected Max Dimensions: {detected_dims}")
-
         print(f"GGUF: Detected Max Dimensions: {detected_dims}")
 
         def safe_get(key, default):
@@ -655,6 +650,10 @@ class WanModel(ModelMixin, ConfigMixin):
             eps=safe_get('eps', 1e-6)
         )
         
+        # Optimize memory: Convert model to target dtype (e.g. bfloat16) immediately
+        # This prevents 56GB allocations for FP32 models
+        model.to(dtype=dtype)
+        
         # 3. Load weights
         state_dict = {}
         model_keys = set(model.state_dict().keys())
@@ -670,31 +669,38 @@ class WanModel(ModelMixin, ConfigMixin):
                     break
             
             if mapped_name in model_keys:
+                # Load as float32 first to avoid precision issues during permute/pad? 
+                # Or load directly? 
+                # tensor.data is numpy. 
                 data = torch.from_numpy(tensor.data.copy())
                 
-                # Manual Padding for patch_embedding if dim mismatch
+                # Permute Patch Embed
                 if mapped_name == "patch_embedding.weight":
-                     # PyTorch expects [out_c, in_c, d, h, w]
-                     # data is [w, h, d, in_c, out_c] (permuted GGUF)?
-                     # No, we assume standard GGUF layout that needs permute.
-                     # Indices: 4, 3, 2, 1, 0
                      data = data.permute(4, 3, 2, 1, 0) # [out_c, in_c, d, h, w]
                 
                 target_shape = model.state_dict()[mapped_name].shape
                 
                 if data.shape != target_shape:
                      if data.ndim == len(target_shape):
-                         # Create padded tensor
-                         new_data = torch.zeros(target_shape, dtype=data.dtype, device=data.device)
+                         # Create padded tensor in target dtype to save memory
+                         new_data = torch.zeros(target_shape, dtype=dtype, device=data.device)
+                         
+                         # Convert source data to dtype
+                         data_casted = data.to(dtype=dtype)
+                         
                          slices = tuple(slice(0, min(ds, ts)) for ds, ts in zip(data.shape, target_shape))
-                         new_data[slices] = data[slices]
+                         new_data[slices] = data_casted[slices]
                          
                          print(f"GGUF: Padded {mapped_name} from {data.shape} to {target_shape}")
                          data = new_data
                      else:
                          print(f"GGUF: Warning - Rank mismatch for {mapped_name}. {data.shape} vs {target_shape}")
+                
+                # Ensure data is correct dtype if not padded
+                if data.dtype != dtype:
+                    data = data.to(dtype=dtype)
 
-                state_dict[mapped_name] = data.to(dtype=dtype)
+                state_dict[mapped_name] = data
                 model_keys.remove(mapped_name)
         
         # 4. Load state dict
