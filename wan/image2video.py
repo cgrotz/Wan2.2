@@ -44,6 +44,8 @@ class WanI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        low_noise_model=None,
+        high_noise_model=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -70,6 +72,10 @@ class WanI2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            low_noise_model (torch.nn.Module, *optional*, defaults to None):
+                Pre-trained low noise model instance.
+            high_noise_model (torch.nn.Module, *optional*, defaults to None):
+                Pre-trained high noise model instance.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -101,23 +107,30 @@ class WanI2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
-        self.low_noise_model = self._configure_model(
-            model=self.low_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        if low_noise_model is None:
+            self.low_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.low_noise_checkpoint)
+            self.low_noise_model = self._configure_model(
+                model=self.low_noise_model,
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
+        else:
+            self.low_noise_model = low_noise_model
 
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
-        self.high_noise_model = self._configure_model(
-            model=self.high_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        if high_noise_model is None:
+            self.high_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.high_noise_checkpoint)
+            self.high_noise_model = self._configure_model(
+                model=self.high_noise_model,
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
+        else:
+            self.high_noise_model = high_noise_model
+
         if use_sp:
             self.sp_size = get_world_size()
         else:
