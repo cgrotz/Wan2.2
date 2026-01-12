@@ -24,7 +24,7 @@ def get_loraconfig(transformer, rank=128, alpha=128, init_lora_weights="gaussian
     )
     return transformer_lora_config
 
-def apply_lora(model, lora_path, alpha=1.0):
+def apply_lora(model, lora_path, alpha=1.0, merge_lora=True):
     """
     Applies LoRA adapters to the given model from a checkpoint file.
     
@@ -34,6 +34,8 @@ def apply_lora(model, lora_path, alpha=1.0):
         alpha (float): Scaling factor for the LoRA adapter (if supported by implementation).
                        Note: PEFT LoraConfig takes alpha, but dynamic scaling might need more work 
                        if we want to adjust it at runtime. For now, we assume standard loading.
+        merge_lora (bool): Whether to merge the LoRA weights into the base model and unload the adapters.
+                           This saves VRAM during inference. Defaults to True.
     """
     if not os.path.exists(lora_path):
         logging.warning(f"LoRA path {lora_path} does not exist. Skipping LoRA loading.")
@@ -71,15 +73,4 @@ def apply_lora(model, lora_path, alpha=1.0):
     
     # Inject adapters
     # Inject adapters
-    # model.add_adapter(lora_config) # WanModel does not support this natively
-    model = get_peft_model(model, lora_config)
-    
-    # Load weights
-    # set_peft_model_state_dict handles the loading into the adapters
-    try:
-        set_peft_model_state_dict(model, lora_state_dict)
-        logging.info("LoRA adapters loaded successfully.")
-    except Exception as e:
-        logging.error(f"Failed to set LoRA state dict: {e}")
-        
-    return model
+    model.add_adapter(lora_config) # WanModel does not support this natively

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from diffusers.loaders import PeftAdapterMixin
 
 from .attention import flash_attention
 
@@ -292,6 +293,7 @@ class Head(nn.Module):
 
 
 class WanModel(ModelMixin, ConfigMixin):
+class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
     """

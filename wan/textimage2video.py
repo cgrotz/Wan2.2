@@ -153,7 +153,7 @@ class WanTI2V:
             dist.barrier()
         
         if lora_path is not None:
-             model = apply_lora(model, lora_path)
+             apply_lora(model, lora_path)
 
         if dit_fsdp:
             model = shard_fn(model)
