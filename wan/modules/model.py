@@ -571,25 +571,28 @@ class WanModel(ModelMixin, ConfigMixin):
         
         cfg = WAN_CONFIGS[config_name]
         
+        def safe_get(key, default):
+            if key in cfg:
+                return cfg[key]
+            return default
+
         # 1. Initialize model structure
-        # Use a plain dict to avoid EasyDict's weird attribute access behavior
-        cfg_dict = dict(cfg)
         model = cls(
-            model_type=cfg_dict.get('model_type', config_name.split('-')[0]),
-            patch_size=cfg_dict.get('patch_size', (1, 2, 2)),
-            text_len=cfg_dict.get('text_len', 512),
-            in_dim=cfg_dict.get('in_dim', 16),
-            dim=cfg_dict.get('dim', 2048),
-            ffn_dim=cfg_dict.get('ffn_dim', 8192),
-            freq_dim=cfg_dict.get('freq_dim', 256),
-            text_dim=cfg_dict.get('text_dim', 4096),
-            out_dim=cfg_dict.get('out_dim', 16),
-            num_heads=cfg_dict.get('num_heads', 16),
-            num_layers=cfg_dict.get('num_layers', 32),
-            window_size=cfg_dict.get('window_size', (-1, -1)),
-            qk_norm=cfg_dict.get('qk_norm', True),
-            cross_attn_norm=cfg_dict.get('cross_attn_norm', True),
-            eps=cfg_dict.get('eps', 1e-6)
+            model_type=safe_get('model_type', config_name.split('-')[0]),
+            patch_size=safe_get('patch_size', (1, 2, 2)),
+            text_len=safe_get('text_len', 512),
+            in_dim=safe_get('in_dim', 16),
+            dim=safe_get('dim', 2048),
+            ffn_dim=safe_get('ffn_dim', 8192),
+            freq_dim=safe_get('freq_dim', 256),
+            text_dim=safe_get('text_dim', 4096),
+            out_dim=safe_get('out_dim', 16),
+            num_heads=safe_get('num_heads', 16),
+            num_layers=safe_get('num_layers', 32),
+            window_size=safe_get('window_size', (-1, -1)),
+            qk_norm=safe_get('qk_norm', True),
+            cross_attn_norm=safe_get('cross_attn_norm', True),
+            eps=safe_get('eps', 1e-6)
         )
         
         # 2. Open GGUF reader
