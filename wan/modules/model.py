@@ -544,3 +544,74 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+    @classmethod
+    def from_gguf(cls, gguf_path, config_name=None, device='cpu', dtype=torch.bfloat16):
+        r"""
+        Load WanModel from a GGUF file.
+
+        Args:
+            gguf_path (str): Path to the GGUF file.
+            config_name (str, optional): Configuration name to use for architectural parameters.
+            device (str, optional): Device to load the model on. Defaults to 'cpu'.
+            dtype (torch.dtype, optional): Precision to convert weights into. Defaults to torch.bfloat16.
+        """
+        import gguf
+        from ..configs import WAN_CONFIGS
+
+        if config_name is None:
+            # Try to infer config from filename or GGUF metadata if possible
+            # For now, we default to t2v-14B if not specified
+            config_name = 't2v-14B'
+            if 'i2v' in gguf_path.lower():
+                config_name = 'i2v-14B'
+        
+        if config_name not in WAN_CONFIGS:
+            raise ValueError(f"Unknown config: {config_name}. Available: {list(WAN_CONFIGS.keys())}")
+        
+        cfg = WAN_CONFIGS[config_name]
+        
+        # 1. Initialize model structure
+        model = cls(
+            model_type=cfg.get('model_type', config_name.split('-')[0]),
+            patch_size=cfg.patch_size,
+            text_len=cfg.text_len,
+            in_dim=cfg.in_dim,
+            dim=cfg.dim,
+            ffn_dim=cfg.ffn_dim,
+            freq_dim=cfg.freq_dim,
+            text_dim=cfg.text_dim,
+            out_dim=cfg.out_dim,
+            num_heads=cfg.num_heads,
+            num_layers=cfg.num_layers,
+            window_size=cfg.window_size,
+            qk_norm=cfg.qk_norm,
+            cross_attn_norm=cfg.cross_attn_norm,
+            eps=cfg.eps
+        )
+        
+        # 2. Open GGUF reader
+        reader = gguf.GGUFReader(gguf_path)
+        
+        state_dict = {}
+        model_keys = set(model.state_dict().keys())
+        
+        for tensor in reader.tensors:
+            name = tensor.name
+            
+            # Key mapping logic
+            mapped_name = name
+            for prefix in ["model.diffusion_model.", "diffusion_model.", "model."]:
+                if name.startswith(prefix):
+                    mapped_name = name[len(prefix):]
+                    break
+            
+            if mapped_name in model_keys:
+                # Conversion to torch tensor
+                data = torch.from_numpy(tensor.data.copy())
+                state_dict[mapped_name] = data.to(dtype=dtype)
+                model_keys.remove(mapped_name)
+        
+        # 3. Load state dict
+        model.load_state_dict(state_dict, strict=False)
+        return model.to(device).eval()
