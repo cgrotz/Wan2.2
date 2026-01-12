@@ -574,52 +574,58 @@ class WanModel(ModelMixin, ConfigMixin):
         # 1. Scan GGUF for architectural parameters
         reader = gguf.GGUFReader(gguf_path)
         
+        cfg = WAN_CONFIGS[config_name]
+
+        # 1. Scan GGUF for architectural parameters
+        reader = gguf.GGUFReader(gguf_path)
+        
         detected_dims = {
             'in_dim': 16,     # Default
-            'dim': 5120,      # Default 14B
+            'dim': 5120,      # Default
             'ffn_dim': 13824  # Default
         }
         
-        print("GGUF: Scanning tensor shapes...")
+        print("GGUF: Scanning all tensor shapes for Max Dimensions...")
         for tensor in reader.tensors:
             name = tensor.name
             shape = tensor.shape
             
             if name.endswith("patch_embedding.weight"):
-                # GGUF shape is usually reversed or special for Conv3d.
-                # Based on error [5120, 36, 1, 2, 5120] -> [5120, 2, 1, 36, 5120] -> permute -> [5120, 36, ...]
-                # Let's assume index 1 is in_dim.
+                # Usually [out, in, d, h, w] or similar.
+                # Among dimensions, 'in_dim' is likely 16 or 36.
+                # 'dim' is likely 5120+.
                 if len(shape) >= 2:
-                    print(f"  Found {name}: {shape}")
-                    detected_dims['in_dim'] = max(detected_dims.get('in_dim', 0), int(shape[1]))
+                    current_in = 16
+                    current_dim = 5120
+                    # Heuristic: find dim=16 or 36.
+                    for s in shape:
+                        if s in [16, 36]: 
+                            current_in = s
+                        elif s > 1000:
+                            current_dim = s
+                    detected_dims['in_dim'] = max(detected_dims['in_dim'], current_in)
+                    detected_dims['dim'] = max(detected_dims['dim'], current_dim)
+            
+            elif "self_attn.q.weight" in name:
+                # Shape [out, in]. 
+                # Both dimensions should be related to 'dim' (or dim and predicted_dim).
+                # We want the max capacity.
+                if len(shape) >= 2:
+                    d_max = max(shape)
+                    detected_dims['dim'] = max(detected_dims['dim'], d_max)
 
-            elif name.endswith("blocks.0.self_attn.q.weight"):
-                # PyTorch: [out, in]
-                # Error: [5120, 5440].
-                # GGUF tensor shape mimics this?
-                # If shape is [5120, 5440]:
-                # Index 1 is input dim -> 5440.
+            elif "ffn.0.weight" in name or "ffn.2.weight" in name:
+                # Shape [d1, d2]. One is dim, one is ffn_dim.
+                # dim < ffn_dim usually.
                 if len(shape) >= 2:
-                    print(f"  Found {name}: {shape}")
-                    detected_dims['dim'] = max(detected_dims.get('dim', 0), int(shape[1]))
-            
-            elif name.endswith("blocks.0.ffn.0.weight"):
-                # PyTorch: [ffn_dim, dim]
-                # Error: [13824, 5440]
-                # shape[1] is dim. shape[0] is ffn_dim.
-                if len(shape) >= 2:
-                    print(f"  Found {name}: {shape}")
-                    detected_dims['dim'] = max(detected_dims.get('dim', 0), int(shape[1]))
-                    detected_dims['ffn_dim'] = max(detected_dims.get('ffn_dim', 0), int(shape[0]))
-            
-            elif name.endswith("blocks.0.ffn.2.weight"):
-                # PyTorch: [dim, ffn_dim]
-                # Error: [5120, 14688]
-                # shape[1] is ffn_dim. shape[0] is dim.
-                if len(shape) >= 2:
-                    print(f"  Found {name}: {shape}")
-                    detected_dims['dim'] = max(detected_dims.get('dim', 0), int(shape[0]))
-                    detected_dims['ffn_dim'] = max(detected_dims.get('ffn_dim', 0), int(shape[1]))
+                    s1, s2 = shape[0], shape[1]
+                    local_dim = min(s1, s2)
+                    local_ffn = max(s1, s2)
+                    
+                    detected_dims['dim'] = max(detected_dims['dim'], local_dim)
+                    detected_dims['ffn_dim'] = max(detected_dims['ffn_dim'], local_ffn)
+        
+        print(f"GGUF: Detected Max Dimensions: {detected_dims}")
 
         print(f"GGUF: Detected Max Dimensions: {detected_dims}")
 
