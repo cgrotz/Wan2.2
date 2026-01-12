@@ -574,20 +574,20 @@ class WanModel(ModelMixin, ConfigMixin):
         # 1. Initialize model structure
         model = cls(
             model_type=cfg.get('model_type', config_name.split('-')[0]),
-            patch_size=cfg.patch_size,
-            text_len=cfg.text_len,
-            in_dim=cfg.in_dim,
-            dim=cfg.dim,
-            ffn_dim=cfg.ffn_dim,
-            freq_dim=cfg.freq_dim,
-            text_dim=cfg.text_dim,
-            out_dim=cfg.out_dim,
-            num_heads=cfg.num_heads,
-            num_layers=cfg.num_layers,
-            window_size=cfg.window_size,
-            qk_norm=cfg.qk_norm,
-            cross_attn_norm=cfg.cross_attn_norm,
-            eps=cfg.eps
+            patch_size=cfg.get('patch_size', (1, 2, 2)),
+            text_len=cfg.get('text_len', 512),
+            in_dim=cfg.get('in_dim', 16),
+            dim=cfg.get('dim', 2048),
+            ffn_dim=cfg.get('ffn_dim', 8192),
+            freq_dim=cfg.get('freq_dim', 256),
+            text_dim=cfg.get('text_dim', 4096),
+            out_dim=cfg.get('out_dim', 16),
+            num_heads=cfg.get('num_heads', 16),
+            num_layers=cfg.get('num_layers', 32),
+            window_size=cfg.get('window_size', (-1, -1)),
+            qk_norm=cfg.get('qk_norm', True),
+            cross_attn_norm=cfg.get('cross_attn_norm', True),
+            eps=cfg.get('eps', 1e-6)
         )
         
         # 2. Open GGUF reader
