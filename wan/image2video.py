@@ -48,6 +48,7 @@ class WanI2V:
         low_noise_model=None,
         high_noise_model=None,
         lora_path=None,
+        lora_path_high=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -133,7 +134,8 @@ class WanI2V:
                 shard_fn=shard_fn,
                 shard_fn=shard_fn,
                 convert_model_dtype=convert_model_dtype,
-                lora_path=lora_path)
+                convert_model_dtype=convert_model_dtype,
+                lora_path=lora_path_high)
         else:
             self.high_noise_model = high_noise_model
 

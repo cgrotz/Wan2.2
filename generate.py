@@ -227,6 +227,12 @@ def _parse_args():
         default=None,
         help="Path to the LoRA checkpoint to load."
     )
+    parser.add_argument(
+        "--lora_path_high",
+        type=str,
+        default=None,
+        help="Path to the high-noise model LoRA checkpoint (only for I2V)."
+    )
 
     # animate
     parser.add_argument(
@@ -535,6 +541,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
             lora_path=args.lora_path,
+            lora_path_high=args.lora_path_high,
         )
         logging.info("Generating video ...")
         video = wan_i2v.generate(
