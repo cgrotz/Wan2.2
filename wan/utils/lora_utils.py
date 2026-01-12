@@ -2,7 +2,8 @@
 import logging
 import os
 import torch
-from peft import LoraConfig, set_peft_model_state_dict
+import torch
+from peft import LoraConfig, set_peft_model_state_dict, get_peft_model
 
 def get_loraconfig(transformer, rank=128, alpha=128, init_lora_weights="gaussian", target_modules=None):
     if target_modules is None:
@@ -69,7 +70,9 @@ def apply_lora(model, lora_path, alpha=1.0):
     )
     
     # Inject adapters
-    model.add_adapter(lora_config)
+    # Inject adapters
+    # model.add_adapter(lora_config) # WanModel does not support this natively
+    model = get_peft_model(model, lora_config)
     
     # Load weights
     # set_peft_model_state_dict handles the loading into the adapters
