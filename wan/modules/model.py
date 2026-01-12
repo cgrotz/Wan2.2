@@ -292,7 +292,6 @@ class Head(nn.Module):
         return x
 
 
-class WanModel(ModelMixin, ConfigMixin):
 class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
