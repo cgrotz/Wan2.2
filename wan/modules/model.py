@@ -570,13 +570,61 @@ class WanModel(ModelMixin, ConfigMixin):
             raise ValueError(f"Unknown config: {config_name}. Available: {list(WAN_CONFIGS.keys())}")
         
         cfg = WAN_CONFIGS[config_name]
+
+        # 1. Scan GGUF for architectural parameters
+        reader = gguf.GGUFReader(gguf_path)
         
+        # Default overrides
+        overrides = {}
+        
+        # Sniff dimensions from known tensors
+        for tensor in reader.tensors:
+            name = tensor.name
+            # Handle potential prefixes
+            if name.endswith("patch_embedding.weight"):
+                # shape: [dim, in_dim, k, k, k]
+                # tensor.data is numpy array, shape is available via tensor.shape
+                # GGUF shape order might be reversed compared to PyTorch? 
+                # gguf-py tensor.shape returns [n, c, h, w] convention usually? 
+                # No, gguf-py tensor.shape is typically [dim0, dim1, ...] in numpy order (C-contiguous)
+                # But PyTorch Conv3d weight is [out_channels, in_channels, d, h, w]
+                # Let's check GGUF spec/gguf-py. 
+                # Usually GGUF stores weights as [out, in] for Linear.
+                # For Conv3d, it might be [out, in, d, h, w].
+                # If mismatch was: [5120, 36, 1, 2, 2] vs [5120, 16, 1, 2, 2]
+                # creating a param with [5120, 36, ...] means the file has 36 at index 1.
+                # So we trust index 1 for in_dim if rank is 5.
+                if len(tensor.shape) == 5:
+                    overrides['in_dim'] = int(tensor.shape[1])
+                    overrides['dim'] = int(tensor.shape[0])
+            
+            elif name.endswith("blocks.0.self_attn.q.weight"):
+                # Linear weight: [out_features, in_features]
+                # Mismatch was: copying [5120, 5440]
+                # This implies out=5120, in=5440.
+                # So dim (input) is index 1.
+                if len(tensor.shape) >= 2:
+                     overrides['dim'] = int(tensor.shape[1])
+            
+            elif name.endswith("blocks.0.ffn.0.weight"):
+                # Linear weight: [out, in] -> [ffn_dim, dim]
+                # Mismatch: [13824, 5440]
+                # So ffn_dim is index 0.
+                if len(tensor.shape) >= 2:
+                    overrides['ffn_dim'] = int(tensor.shape[0])
+
+        if overrides:
+            print(f"GGUF: Detected overrides from weights: {overrides}")
+
         def safe_get(key, default):
+            # Prioritize overrides, then config
+            if key in overrides:
+                return overrides[key]
             if key in cfg:
                 return cfg[key]
             return default
 
-        # 1. Initialize model structure
+        # 2. Initialize model structure
         model = cls(
             model_type=safe_get('model_type', config_name.split('-')[0]),
             patch_size=safe_get('patch_size', (1, 2, 2)),
@@ -595,9 +643,7 @@ class WanModel(ModelMixin, ConfigMixin):
             eps=safe_get('eps', 1e-6)
         )
         
-        # 2. Open GGUF reader
-        reader = gguf.GGUFReader(gguf_path)
-        
+        # 3. Load weights
         state_dict = {}
         model_keys = set(model.state_dict().keys())
         
@@ -614,9 +660,18 @@ class WanModel(ModelMixin, ConfigMixin):
             if mapped_name in model_keys:
                 # Conversion to torch tensor
                 data = torch.from_numpy(tensor.data.copy())
+                # Squeeze/Reshape check? 
+                # Typically data is loaded as is. If there was a transpose needed (e.g. for Linear), 
+                # GGUF usually stores it 'transposed' relative to Torch or vice-versa?
+                # PyTorch Linear weight is [out, in].
+                # GGUF usually stores [in, out] if it's from llama.cpp context? 
+                # Wait, the error message said "copying param with shape [5120, 5440]".
+                # This matches PyTorch expectation for Linear(in=5440, out=5120).
+                # So we probably don't need to transpose.
+                
                 state_dict[mapped_name] = data.to(dtype=dtype)
                 model_keys.remove(mapped_name)
         
-        # 3. Load state dict
+        # 4. Load state dict
         model.load_state_dict(state_dict, strict=False)
         return model.to(device).eval()
