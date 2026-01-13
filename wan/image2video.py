@@ -497,17 +497,16 @@ class WanI2V:
             previous_video (`torch.Tensor`, optional):
                 Previous video tensor [C, N, H, W] or [N, H, W, C] (auto-detected).
                 Used for continuation if start_image is None.
-            start_image (`torch.Tensor`, optional):
-                Start frame [C, H, W]. Takes precedence over previous_video.
-            end_image (`torch.Tensor`, optional):
-                End frame [C, H, W]. Used for loop/target constraint.
+            start_image (`PIL.Image.Image`, optional):
+                Start frame. Takes precedence over previous_video.
+            end_image (`PIL.Image.Image`, optional):
+                End frame. Used for loop/target constraint.
             motion_amplitude (`float`):
                 Enhance motion in the conditioning latent. >1.0 increases motion.
             motion_frames (`int`):
                 Number of frames from previous_video to use for continuity.
-            initial_reference_image (`torch.Tensor`, optional):
-                Reference image [C, H, W]. (Currently used for visual continuity if needed, 
-                logic primarily uses start/end images).
+            initial_reference_image (`PIL.Image.Image`, optional):
+                Reference image for visual continuity.
             **kwargs:
                 Passed to generate (e.g. shift, sampling_steps, seed, offload_model).
 
@@ -538,6 +537,15 @@ class WanI2V:
         # and ensure [C, F, H, W] for video, [C, H, W] for image
         def _normalize_input(t, is_video=False):
             if t is None: return None
+            
+            # If not a tensor, assume it is a PIL Image
+            if not isinstance(t, torch.Tensor):
+                t = TF.to_tensor(t).sub_(0.5).div_(0.5).to(device)
+                return t
+
+            # For tensors, ensure they are moved to device
+            t = t.to(device)
+
             # Check last dim vs first dim for Channel=3
             if t.shape[-1] == 3: # likely [..., H, W, C]
                 if is_video: # [F, H, W, 3] -> [3, F, H, W]
@@ -573,8 +581,9 @@ class WanI2V:
         # Latents are downscaled by 8.
         
         # 3. Canvas Construction
-        # Create base image buffer [C, F, H, W]
-        image_seq = torch.full((3, frame_num, height, width), 0.5, device=device, dtype=torch.float32)
+        # Create base image buffer [C, F, H, W]. 
+        # Gray in normalized space [-1, 1] is 0.0.
+        image_seq = torch.zeros((3, frame_num, height, width), device=device, dtype=torch.float32)
         
         # Mask: 1=Cond, 0=Gen. Init to 0. (Wan convention: 1 is kept)
         # Latent dimensions
@@ -648,9 +657,9 @@ class WanI2V:
         # This implies it encodes a tensor where other frames are zero/gray?
         # If we provide full video buffer, we should just encode it.
         
-        # Prepare for VAE: [B, C, F, H, W]
-        vae_input = image_seq.unsqueeze(0) # [1, 3, F, H, W]
-        y = self.vae.encode([vae_input])[0] # [C_out, LatF, LatH, LatW]
+        # Prepare for VAE: [C, F, H, W]
+        # vae.encode expects a list of [C, T, H, W], and it will unsqueeze(0) internally.
+        y = self.vae.encode([image_seq])[0] # [C_out, LatF, LatH, LatW]
         
         # Prepare Mask for concatenation
         # msk was [1, F, lat_h, lat_w]
