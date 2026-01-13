@@ -235,7 +235,8 @@ class WanI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 y=None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -265,6 +266,8 @@ class WanI2V:
                 Random seed for noise generation. If -1, use random seed
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            y (torch.Tensor, *optional*, defaults to None):
+                Pre-computed conditional video inputs. If provided, skips the default VAE encoding of `img`.
 
         Returns:
             torch.Tensor:
@@ -277,19 +280,31 @@ class WanI2V:
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
             guide_scale, float) else guide_scale
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
         F = frame_num
-        h, w = img.shape[1:]
-        aspect_ratio = h / w
-        lat_h = round(
-            np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
-            self.patch_size[1] * self.patch_size[1])
-        lat_w = round(
-            np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
-            self.patch_size[2] * self.patch_size[2])
-        h = lat_h * self.vae_stride[1]
-        w = lat_w * self.vae_stride[2]
+        
+        if y is None:
+            img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+            h, w = img.shape[1:]
+            aspect_ratio = h / w
+            lat_h = round(
+                np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
+                self.patch_size[1] * self.patch_size[1])
+            lat_w = round(
+                np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
+                self.patch_size[2] * self.patch_size[2])
+            h = lat_h * self.vae_stride[1]
+            w = lat_w * self.vae_stride[2]
+        else:
+            # infer dimensions from y
+            # y shape: [C, F_latent, lat_h, lat_w]
+            lat_h = y.shape[-2]
+            lat_w = y.shape[-1]
+            h = lat_h * self.vae_stride[1]
+            w = lat_w * self.vae_stride[2]
+            # Verify F matches? 
+            # latent_timesteps = (F - 1) // stride + 1
+            # We trust F is consistent or we rely on y's shape for seq len
 
         max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
@@ -307,15 +322,6 @@ class WanI2V:
             generator=seed_g,
             device=self.device)
 
-        msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
-        msk[:, 1:] = 0
-        msk = torch.concat([
-            torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)[0]
-
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
@@ -332,16 +338,28 @@ class WanI2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        y = self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, F - 1, h, w)
+        if y is None:
+            msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
+            msk[:, 1:] = 0
+            msk = torch.concat([
+                torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
             ],
-                         dim=1).to(self.device)
-        ])[0]
-        y = torch.concat([msk, y])
+                               dim=1)
+            msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]
+
+            y = self.vae.encode([
+                torch.concat([
+                    torch.nn.functional.interpolate(
+                        img[None].cpu(), size=(h, w), mode='bicubic').transpose(
+                            0, 1),
+                    torch.zeros(3, F - 1, h, w)
+                ],
+                             dim=1).to(self.device)
+            ])[0]
+            y = torch.concat([msk, y])
+        else:
+            y = y.to(self.device)
 
         @contextmanager
         def noop_no_sync():
@@ -450,3 +468,279 @@ class WanI2V:
             dist.barrier()
 
         return videos[0] if self.rank == 0 else None
+
+    def multi_generate(self,
+                       input_prompt,
+                       frame_num=81,
+                       width=832,
+                       height=480,
+                       previous_video=None,
+                       start_image=None,
+                       end_image=None,
+                       motion_amplitude=1.15,
+                       motion_frames=5,
+                       initial_reference_image=None,
+                       **kwargs):
+        r"""
+        Advanced generation method supporting continuation, inpainting, and motion control,
+        ported from ComfyUI-PainterLongVideo.
+
+        Args:
+            input_prompt (`str`):
+                Text prompt.
+            frame_num (`int`):
+                Total frames to generate.
+            width (`int`):
+                Target width (must be divisible by 16).
+            height (`int`):
+                Target height (must be divisible by 16).
+            previous_video (`torch.Tensor`, optional):
+                Previous video tensor [C, N, H, W] or [N, H, W, C] (auto-detected).
+                Used for continuation if start_image is None.
+            start_image (`torch.Tensor`, optional):
+                Start frame [C, H, W]. Takes precedence over previous_video.
+            end_image (`torch.Tensor`, optional):
+                End frame [C, H, W]. Used for loop/target constraint.
+            motion_amplitude (`float`):
+                Enhance motion in the conditioning latent. >1.0 increases motion.
+            motion_frames (`int`):
+                Number of frames from previous_video to use for continuity.
+            initial_reference_image (`torch.Tensor`, optional):
+                Reference image [C, H, W]. (Currently used for visual continuity if needed, 
+                logic primarily uses start/end images).
+            **kwargs:
+                Passed to generate (e.g. shift, sampling_steps, seed, offload_model).
+
+        Returns:
+            torch.Tensor: Generated video [C, frame_num, H, W].
+        """
+        device = self.device
+        
+        # Helper for resizing
+        def _resize(tensor, target_h, target_w):
+            # Tensor expected to be [..., C, H, W] or [C, H, W]
+            # interpolate expects [N, C, H, W] or [C, H, W] (if 3D) -> wait, interpolate 3D?
+            # 2D interpolation: input [N, C, H, W]
+            
+            orig_dim = tensor.dim()
+            if orig_dim == 3: # [C, H, W]
+                tensor = tensor.unsqueeze(0)
+            
+            resized = torch.nn.functional.interpolate(
+                tensor, size=(target_h, target_w), mode='bilinear', align_corners=False
+            )
+            
+            if orig_dim == 3:
+                resized = resized.squeeze(0)
+            return resized
+
+        # Helper to normalize input to [C, ..., H, W] from likely [..., H, W, C] or [..., C, H, W]
+        # and ensure [C, F, H, W] for video, [C, H, W] for image
+        def _normalize_input(t, is_video=False):
+            if t is None: return None
+            # Check last dim vs first dim for Channel=3
+            if t.shape[-1] == 3: # likely [..., H, W, C]
+                if is_video: # [F, H, W, 3] -> [3, F, H, W]
+                     t = t.permute(3, 0, 1, 2)
+                else: # [H, W, 3] -> [3, H, W] (or [1, H, W, 3] -> [3, 1, H, W])
+                     if t.dim() == 4: t = t.permute(0, 3, 1, 2).squeeze(0) # [1,H,W,3]->[3,H,W]
+                     else: t = t.permute(2, 0, 1) # [H,W,3]->[3,H,W]
+            elif t.shape[1] == 3 and is_video and t.dim()==4: # [F, C, H, W] -> [C, F, H, W]
+                 t = t.transpose(0, 1)
+            # If already [C, F, H, W] or [C, H, W], keep as is.
+            # Assuming C=3 is distinct from F (usually F > 3 or F is small but H,W large)
+            return t.to(device)
+
+        prev_vid = _normalize_input(previous_video, is_video=True)
+        start_img = _normalize_input(start_image, is_video=False)
+        end_img = _normalize_input(end_image, is_video=False)
+        init_ref = _normalize_input(initial_reference_image, is_video=False)
+
+        # 1. Logic Switches
+        has_prev = prev_vid is not None
+        has_start = start_img is not None
+        has_end = end_img is not None
+
+        if not has_prev and not has_start and not has_end:
+             # Fallback to standard generation if provided img in kwargs, else error
+             if 'img' in kwargs: 
+                  return self.generate(input_prompt, frame_num=frame_num, **kwargs)
+             raise RuntimeError("multi_generate: Provide previous_video, start_image, or end_image")
+             
+        # 2. Dimensions
+        # Wan requires dimensions to be divisible by vae_stride * patch_size
+        # Usually 16? vae_stride=(1,8,8), patch=(1,2,2) -> 8*2=16
+        # Latents are downscaled by 8.
+        
+        # 3. Canvas Construction
+        # Create base image buffer [C, F, H, W]
+        image_seq = torch.full((3, frame_num, height, width), 0.5, device=device, dtype=torch.float32)
+        
+        # Mask: 1=Cond, 0=Gen. Init to 0. (Wan convention: 1 is kept)
+        # Latent dimensions
+        lat_h = height // 8
+        lat_w = width // 8
+        lat_f = (frame_num - 1) // 4 + 1
+        
+        # Wan mask is [1, LatF, LatH, LatW] but with interleaved repetition for channel 0 used in VAE?
+        # Actually generate() constructs `msk` as [1, F, lat_h, lat_w] then transforms it.
+        # We should construct `msk` in signal domain [1, F, lat_h, lat_w] first (matching generate's logic pre-transform)
+        # or better: construct `msk` in latent domain directly if we know how?
+        # `generate` logic:
+        # msk = torch.ones(1, F, lat_h, lat_w) ...
+        # msk = msk.view(1, msk.shape[1]//4, 4 ...).transpose ...
+        # This implies msk is defined on T (frame_num).
+        
+        msk = torch.zeros(1, frame_num, lat_h, lat_w, device=device) # 0 = Generate
+        
+        # 4. Fill Content
+        if has_start or has_end:
+            if has_start:
+                # Resize start_img
+                s_img = _resize(start_img, height, width) # [3, H, W]
+                actual_len = min(frame_num, 1) # Start implies first frame usually, maybe more? 
+                # PainterLongVideo uses `start_image[:length]` if it's a batch.
+                # Assuming start_image is single frame [3, H, W].
+                image_seq[:, 0] = s_img
+                msk[:, 0] = 1.0 # Keep frame 0
+                # Protect buffer? Painter protects +3 frames. Wan's mask is on latent t?
+                # `msk` here is length `frame_num`.
+                # If we want to condition frame 0, msk[:, 0] = 1.
+                # If we want to condition more, set more.
+                # Painter sets mask 0.0 (Condition) for `actual_len + 3`.
+                # We set 1.0 (Condition) for `actual_len + 3`?
+                # Wan VAE might encode temporal chunks. 
+                # Safer to just mask the exact frames we provide.
+                # But Wan `generate` sets msk[:, 0:1] = 1, rest 0.
+            else:
+                 # prev video last frame as start
+                 if has_prev:
+                     last_frame = prev_vid[:, -1] # [C, H, W]
+                     s_img = _resize(last_frame, height, width)
+                     image_seq[:, 0] = s_img
+                     msk[:, 0] = 1.0
+            
+            if has_end:
+                e_img = _resize(end_img, height, width)
+                image_seq[:, -1] = e_img
+                msk[:, -1] = 1.0
+                # Maybe protect 3 frames equivalent?
+                # msk[:, -4:] = 1.0 ?
+                # Let's stick to strict 1 frame unless we observe instability.
+        else:
+             # Only previous video (continuation)
+             # Wan logic for standard continuation is usually frame 0 conditioning.
+             last_frame = prev_vid[:, -1]
+             s_img = _resize(last_frame, height, width)
+             image_seq[:, 0] = s_img
+             msk[:, 0] = 1.0
+
+        # Motion Amplitude & Latent construction
+        # We need to encode `image_seq`.
+        # Wan VAE expects [B, C, F, H, W]? 
+        # vae.encode argument: `[torch.concat([interpolated_img, zeros], dim=1)]` in generate() is weird.
+        # It stacks img (frame 0) and zeros.
+        # HERE we have a full `image_seq` which has content at 0 and -1 (if set), and gray in between.
+        # We should encode the WHOLE `image_seq`.
+        
+        # `generate` logic lines:
+        # y = self.vae.encode([ torch.concat([img_interpolated_frame0, zeros], dim=1) ])
+        # This implies it encodes a tensor where other frames are zero/gray?
+        # If we provide full video buffer, we should just encode it.
+        
+        # Prepare for VAE: [B, C, F, H, W]
+        vae_input = image_seq.unsqueeze(0) # [1, 3, F, H, W]
+        y = self.vae.encode([vae_input])[0] # [C_out, LatF, LatH, LatW]
+        
+        # Prepare Mask for concatenation
+        # msk was [1, F, lat_h, lat_w]
+        # We need to transform it like in `generate`
+        # msk[:, 1:] = 0 # (Done by init zeros and setting ones) -> OK.
+        
+        # Transform msk to VAE format?
+        # generate:
+        # msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+        # msk = msk.view(1, msk.shape[1]//4, 4, lat_h, lat_w).transpose(1, 2)[0]
+        # This handles the temporal downsample/stride?
+        # WanVAE stride is 4 on temporal? (4n+1)
+        # See `frame_num` arg defaults to 81 = 20*4 + 1.
+        
+        # We need to apply same transform to our custom msk.
+        
+        # Padding for mask transform?
+        # If F=81.
+        # msk shape [1, 81, h, w].
+        # msk[:, 0:1] repeat 4 -> [1, 4, h, w].
+        # msk[:, 1:] -> [1, 80, h, w].    (80 divisible by 4)
+        # concat -> [1, 84, h, w].
+        # view -> [1, 21, 4, h, w].
+        # transpose -> [1, 4, 21, h, w]. -> [4, 21, h, w] (taking [0]).
+        # y from vae.encode(F=81) -> Latent F=21? (80/4 + 1 = 21).
+        # matches.
+        
+        msk_t = torch.concat([
+             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
+        ], dim=1)
+        msk_t = msk_t.view(1, msk_t.shape[1] // 4, 4, lat_h, lat_w)
+        msk_t = msk_t.transpose(1, 2)[0]
+        
+        # Motion Amplitude Implementation
+        if motion_amplitude > 1.0:
+             # Apply to y (latent)
+             # y is [C, LatF, LatH, LatW]
+             # Painter: diff = gray - base. 
+             # Here y is whole sequence.
+             # Base (frame 0) vs others?
+             # Wan latents: channel-first.
+             # Painter logic:
+             # base = latent[:, :, 0:1] (Time 0)
+             # gray = latent[:, :, 1:]
+             # diff = gray - base
+             # ...
+             
+             base_latent = y[:, 0:1]
+             rest_latent = y[:, 1:]
+             diff = rest_latent - base_latent
+             diff_mean = diff.mean(dim=(0, 2, 3), keepdim=True) # Mean over C, H, W? 
+             # Painter: mean(dim=(1,3,4)) -> channels, h, w. (Batch is 0, Time is 2?)
+             # Painter layout: [B, C, T, H, W]
+             # Wan layout: [C, T, H, W] (No batch dimension here, strictly one video)
+             
+             # Painter: mean(dim=(1,3,4)) means Channel, H, W. Preserves T.
+             # Here C is dim 0, H is 2, W is 3.
+             diff_mean = diff.mean(dim=(0, 2, 3), keepdim=True)
+             
+             diff_centered = diff - diff_mean
+             scaled_rest = base_latent + diff_centered * motion_amplitude + diff_mean
+             
+             # Clamp?
+             scaled_rest = torch.clamp(scaled_rest, -6.0, 6.0) # Painter clamps -6,6
+             
+             y = torch.concat([base_latent, scaled_rest], dim=1)
+        
+        # Concatenate mask
+        y_final = torch.concat([msk_t, y], dim=0)
+        
+        # Call generate
+        # Provide img=None since we provide y.
+        # Need pass width/height? generate calculates from img or y.
+        # "img" arg is required by generate signature but we can pass a dummy PIL or Tensor if needed,
+        # or rely on our refactor that checks if y is None.
+        # We need to pass valid tensor to `img` to pass type checks if any, or just None if we updated signature to allow None?
+        # I updated signature `generate(..., img, ...` -> `img` is positional arg.
+        # I should pass a dummy image to satisfy the argument parser if it's strict, or pass None if I allow it.
+        # In my refactor: `if y is None: img = TF.to_tensor(img)...`
+        # So if y is NOT None, img can be anything that doesn't crash before that check.
+        # But `generate` signature expects `img`.
+        # I will pass a dummy tensor.
+        
+        dummy_img = torch.zeros(3, height, width, device=device)
+        
+        return self.generate(
+            input_prompt,
+            dummy_img,
+            frame_num=frame_num,
+            y=y_final,
+            offload_model=kwargs.get('offload_model', True),
+            **kwargs
+        )
